@@ -1,0 +1,338 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/insert/test_insert_partition_overwrite.test
+# description: Ordinary inserts can atomically replace the partitions present in their input
+# group: [insert]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+include test/sql/init_requires
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.insert_partition_overwrite;
+
+statement ok
+CREATE TABLE my_datalake.default.insert_partition_overwrite (p INTEGER, q VARCHAR, id INTEGER)
+PARTITIONED BY (p, q);
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite VALUES
+(1, 'x', 10), (1, 'y', 20), (2, 'x', 30), (NULL, 'x', 40), (1, NULL, 50);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite VALUES
+(1, 'x', 101), (1, 'x', 102), (3, 'x', 301), (NULL, 'x', 401);
+
+query ITI
+SELECT * FROM my_datalake.default.insert_partition_overwrite ORDER BY id;
+----
+1	y	20
+2	x	30
+1	NULL	50
+1	x	101
+1	x	102
+3	x	301
+NULL	x	401
+
+# Empty input does not replace data or create a snapshot.
+statement ok
+SET VARIABLE snapshot_count = (SELECT count(*) FROM iceberg_snapshots(my_datalake.default.insert_partition_overwrite));
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite SELECT * FROM my_datalake.default.insert_partition_overwrite WHERE false;
+
+query I
+SELECT count(*) - getvariable('snapshot_count') FROM iceberg_snapshots(my_datalake.default.insert_partition_overwrite);
+----
+0
+
+# The input can read the partitions being replaced.
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite
+SELECT p, q, id + 1000 FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x';
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x' ORDER BY id;
+----
+1101
+1102
+
+# UPDATE uses its row-level semantics even while the setting is enabled.
+statement ok
+UPDATE my_datalake.default.insert_partition_overwrite SET id = 1103 WHERE id = 1101;
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x' ORDER BY id;
+----
+1102
+1103
+
+# An insert-only MERGE preserves existing rows in the matching partition.
+statement ok
+MERGE INTO my_datalake.default.insert_partition_overwrite t
+USING (VALUES (1, 'x', 1104)) s(p, q, id) ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (p, q, id) VALUES (s.p, s.q, s.id);
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x' ORDER BY id;
+----
+1102
+1103
+1104
+
+statement ok
+DELETE FROM my_datalake.default.insert_partition_overwrite WHERE id = 1104;
+
+# Later statements see replacements staged in the same transaction; rollback restores both.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite VALUES (1, 'x', 201);
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite VALUES (1, 'x', 202);
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x';
+----
+202
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x' ORDER BY id;
+----
+1102
+1103
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite VALUES (1, 'x', 203);
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite
+SELECT p, q, id + 1 FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x';
+
+statement ok
+COMMIT;
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x';
+----
+204
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'append';
+
+statement ok
+INSERT INTO my_datalake.default.insert_partition_overwrite VALUES (1, 'x', 205);
+
+query I
+SELECT id FROM my_datalake.default.insert_partition_overwrite WHERE p = 1 AND q = 'x' ORDER BY id;
+----
+204
+205
+
+statement ok
+DROP TABLE my_datalake.default.insert_partition_overwrite;
+
+# Transform outputs determine the replacement boundary.
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.insert_transform_overwrite;
+
+statement ok
+CREATE TABLE my_datalake.default.insert_transform_overwrite (k INTEGER, id INTEGER)
+PARTITIONED BY (truncate(10, k));
+
+statement ok
+INSERT INTO my_datalake.default.insert_transform_overwrite VALUES (11, 1), (12, 2), (21, 3);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok
+INSERT INTO my_datalake.default.insert_transform_overwrite VALUES (19, 4);
+
+query II
+SELECT * FROM my_datalake.default.insert_transform_overwrite ORDER BY id;
+----
+21	3
+19	4
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'append';
+
+statement ok
+ALTER TABLE my_datalake.default.insert_transform_overwrite SET PARTITIONED BY (k);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement error
+INSERT INTO my_datalake.default.insert_transform_overwrite VALUES (21, 5);
+----
+mixed partition specs are not supported
+
+query I
+SELECT count(*) FROM my_datalake.default.insert_transform_overwrite;
+----
+2
+
+statement ok
+DROP TABLE my_datalake.default.insert_transform_overwrite;
+
+# Floating-point partition equality distinguishes signed zero and treats NaNs consistently.
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.insert_float_overwrite;
+
+statement ok
+CREATE TABLE my_datalake.default.insert_float_overwrite (f FLOAT, d DOUBLE, id INTEGER) PARTITIONED BY (f, d);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'append';
+
+statement ok
+INSERT INTO my_datalake.default.insert_float_overwrite VALUES (0.0, 0.0, 1);
+
+statement ok
+INSERT INTO my_datalake.default.insert_float_overwrite VALUES ('-0.0'::FLOAT, '-0.0'::DOUBLE, 2);
+
+statement ok
+INSERT INTO my_datalake.default.insert_float_overwrite VALUES ('NaN'::FLOAT, 'NaN'::DOUBLE, 3);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok
+INSERT INTO my_datalake.default.insert_float_overwrite VALUES (0.0, 0.0, 4);
+
+statement ok
+INSERT INTO my_datalake.default.insert_float_overwrite VALUES ('NaN'::FLOAT, 'NaN'::DOUBLE, 5);
+
+query I
+SELECT id FROM my_datalake.default.insert_float_overwrite ORDER BY id;
+----
+2
+4
+5
+
+statement ok
+DROP TABLE my_datalake.default.insert_float_overwrite;
+
+# Writer strings and typed Avro values share the same partition tuple.
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.insert_typed_overwrite;
+
+statement ok
+CREATE TABLE my_datalake.default.insert_typed_overwrite (ts TIMESTAMP, d DATE, price DECIMAL(9, 2), id INTEGER)
+PARTITIONED BY (day(ts), d, price);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'append';
+
+statement ok
+INSERT INTO my_datalake.default.insert_typed_overwrite VALUES
+('2000-01-01 01:00:00', '1999-01-01', 1.25, 1),
+('2000-01-01 02:00:00', '1999-01-01', 1.25, 2),
+('2000-01-02 01:00:00', '1999-01-01', 1.25, 3);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok
+INSERT INTO my_datalake.default.insert_typed_overwrite VALUES ('2000-01-01 03:00:00', '1999-01-01', 1.25, 4);
+
+query I
+SELECT id FROM my_datalake.default.insert_typed_overwrite ORDER BY id;
+----
+3
+4
+
+statement ok
+DROP TABLE my_datalake.default.insert_typed_overwrite;
+
+# An unpartitioned table is one replacement scope.
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.insert_unpartitioned_overwrite;
+
+statement ok
+CREATE TABLE my_datalake.default.insert_unpartitioned_overwrite (id INTEGER);
+
+statement ok
+INSERT INTO my_datalake.default.insert_unpartitioned_overwrite VALUES (1), (2);
+
+statement ok
+PREPARE overwrite_insert AS INSERT INTO my_datalake.default.insert_unpartitioned_overwrite VALUES (3);
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'append';
+
+statement ok
+EXECUTE overwrite_insert;
+
+query I
+SELECT count(*) FROM my_datalake.default.insert_unpartitioned_overwrite;
+----
+3
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok
+EXECUTE overwrite_insert;
+
+statement ok
+DEALLOCATE overwrite_insert;
+
+statement ok
+INSERT INTO my_datalake.default.insert_unpartitioned_overwrite SELECT 4 WHERE false;
+
+query I
+SELECT * FROM my_datalake.default.insert_unpartitioned_overwrite;
+----
+3
+
+statement ok
+DROP TABLE my_datalake.default.insert_unpartitioned_overwrite;
+
+# Later metadata changes in the same transaction retain the insert's original write schema/spec.
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.insert_overwrite_metadata;
+
+statement ok
+CREATE TABLE my_datalake.default.insert_overwrite_metadata (p INTEGER, id INTEGER) PARTITIONED BY (p);
+
+statement ok
+INSERT INTO my_datalake.default.insert_overwrite_metadata VALUES (1, 1), (2, 2);
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO my_datalake.default.insert_overwrite_metadata VALUES (1, 3);
+
+statement ok
+ALTER TABLE my_datalake.default.insert_overwrite_metadata ADD COLUMN extra INTEGER;
+
+statement ok
+ALTER TABLE my_datalake.default.insert_overwrite_metadata SET PARTITIONED BY (id);
+
+statement ok
+COMMIT;
+
+query III
+SELECT p, id, extra FROM my_datalake.default.insert_overwrite_metadata ORDER BY p;
+----
+1	3	NULL
+2	2	NULL
+
+statement ok
+DROP TABLE my_datalake.default.insert_overwrite_metadata;
+
+statement ok
+RESET iceberg_insert_existing_partitions_behavior;

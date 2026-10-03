@@ -26,7 +26,8 @@ IcebergAddSnapshot::IcebergAddSnapshot(const IcebergTable &table_info, IcebergSn
 
 bool IcebergAddSnapshot::IsRetryable() const {
 	//! DELETE-retry safety is enforced in StageSingleTableCommit.
-	return operation == IcebergSnapshotOperationType::APPEND || operation == IcebergSnapshotOperationType::DELETE;
+	return operation == IcebergSnapshotOperationType::APPEND || operation == IcebergSnapshotOperationType::DELETE ||
+	       partition_overwrite.has_value();
 }
 
 static rest_api_objects::TableUpdate CreateAddSnapshotUpdate(const IcebergTable &table_info,
@@ -50,6 +51,16 @@ static optional<IcebergManifestListEntry> RewriteManifestFile(const IcebergManif
 	                           : IcebergManifestMerge::ScanManifestEntries(list_entry, commit_state, schema_id);
 	D_ASSERT(loaded_manifest.manifest_metadata);
 	auto &scanned_entries = loaded_manifest.GetManifestEntries();
+	//! Existing and deleted V3 entries must retain their inherited row IDs when rewritten.
+	if (loaded_manifest.file.content == IcebergManifestContentType::DATA && loaded_manifest.file.first_row_id) {
+		auto inherited_row_id = *loaded_manifest.file.first_row_id;
+		for (auto &entry : scanned_entries) {
+			if (!entry.data_file.HasFirstRowId()) {
+				entry.data_file.SetFirstRowId(inherited_row_id);
+				inherited_row_id += entry.data_file.record_count;
+			}
+		}
+	}
 
 	vector<IcebergManifestEntry> rewritten_entries;
 	rewritten_entries.reserve(scanned_entries.size());
@@ -165,6 +176,9 @@ CreateCommitManifestFiles(const vector<IcebergManifestListEntry> &manifest_files
 
 void IcebergAddSnapshot::CreateUpdate(DatabaseInstance &db, ClientContext &context,
                                       IcebergCommitState &commit_state) const {
+	if (partition_overwrite) {
+		partition_overwrite->Validate(commit_state);
+	}
 	auto &system_catalog = Catalog::GetSystemCatalog(db);
 	auto data = CatalogTransaction::GetSystemTransaction(db);
 	auto &schema = system_catalog.GetSchema(data, Identifier::DefaultSchema());
@@ -249,6 +263,10 @@ void IcebergAddSnapshot::AddManifestFile(IcebergManifestListEntry &&manifest_fil
 
 void IcebergAddSnapshot::SetManifestDeletes(VersionedIcebergManifestDeletes manifest_deletes_p) {
 	manifest_deletes.emplace(std::move(manifest_deletes_p));
+}
+
+void IcebergAddSnapshot::SetPartitionOverwrite(IcebergPartitionOverwrite overwrite) {
+	partition_overwrite.emplace(std::move(overwrite));
 }
 
 const vector<IcebergManifestListEntry> &IcebergAddSnapshot::GetManifestFiles() const {

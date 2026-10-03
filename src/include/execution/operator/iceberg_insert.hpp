@@ -93,6 +93,7 @@ public:
 	mutex lock;
 	vector<IcebergManifestEntry> written_files;
 	atomic<idx_t> insert_count;
+	bool overwrite_partitions = false;
 };
 
 class IcebergInsert : public PhysicalOperator {
@@ -116,6 +117,8 @@ public:
 	//! When set, this insert is a CTAS whose table is created lazily by this copy operator (its child).
 	//! Sink/Finalize resolve the TableCatalogEntry through it instead of through `table`.
 	optional_ptr<IcebergCopyToFile> ctas_copy_op;
+	//! Only ordinary INSERT INTO honors the session's existing-partition behavior.
+	bool use_insert_partition_behavior = false;
 
 public:
 	// Source interface

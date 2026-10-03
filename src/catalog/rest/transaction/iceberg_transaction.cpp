@@ -184,6 +184,10 @@ static void CreateTableRequirements(DatabaseInstance &db, ClientContext &context
 		AssertCurrentSchemaIdRequirement requirement(transaction_data.initial_schema_id);
 		requirement.CreateRequirement(db, context, commit_state);
 	}
+	if (!has_assert_create && transaction_data.assert_default_spec_id) {
+		AssertDefaultSpecIdRequirement requirement(transaction_data.initial_default_spec_id);
+		requirement.CreateRequirement(db, context, commit_state);
+	}
 	if (!has_assert_create && commit_state.table_info.HasTransactionUpdates()) {
 		auto uuid_requirement = AssertTableUUIDRequirement(transaction_data.initial_table_uuid);
 		uuid_requirement.CreateRequirement(db, context, commit_state);
@@ -276,10 +280,12 @@ static void VerifyDeleteRetryability(const IcebergTable &table_info,
 	    table_info.name, std::to_string(scan_snapshot_id), std::to_string(tip_snapshot_id));
 }
 
-static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, IcebergTable &table_info,
-                                                      ClientContext &context) {
+void RemoveFilesBestEffort(ClientContext &context, FileSystem &fs, const vector<string> &paths,
+                           const char *description);
+
+static SingleTableStagedCommit CreateSingleTableCommit(DatabaseInstance &db, IcebergTable &table_info,
+                                                       ClientContext &context, IcebergCommitState &commit_state) {
 	SingleTableStagedCommit info;
-	IcebergCommitState commit_state(table_info, context);
 	auto &table_change = commit_state.table_change;
 	auto &schema = table_info.schema.Cast<IcebergSchemaEntry>();
 	table_change.identifier = rest_api_objects::TableIdentifier();
@@ -319,6 +325,21 @@ static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, Iceb
 	return info;
 }
 
+static SingleTableStagedCommit StageSingleTableCommit(DatabaseInstance &db, IcebergTable &table_info,
+                                                      ClientContext &context) {
+	IcebergCommitState commit_state(table_info, context);
+	try {
+		return CreateSingleTableCommit(db, table_info, context, commit_state);
+	} catch (...) {
+		//! No request has been sent: validation failures can safely discard metadata written while staging.
+		if (table_info.catalog.attach_options.remove_files_on_delete) {
+			auto &fs = FileSystem::GetFileSystem(context);
+			RemoveFilesBestEffort(context, fs, commit_state.created_metadata_files, "metadata file");
+		}
+		throw;
+	}
+}
+
 static MultiTableStagedCommit StageMultiTableCommit(DatabaseInstance &db, IcebergTransactionAlterUpdate &alter_update,
                                                     ClientContext &context) {
 	MultiTableStagedCommit info;
@@ -332,7 +353,17 @@ static MultiTableStagedCommit StageMultiTableCommit(DatabaseInstance &db, Iceber
 			continue;
 		}
 
-		auto table_transaction_info = StageSingleTableCommit(db, table_info, context);
+		SingleTableStagedCommit table_transaction_info;
+		try {
+			table_transaction_info = StageSingleTableCommit(db, table_info, context);
+		} catch (...) {
+			//! Also discard metadata for tables staged earlier in this unsent atomic request.
+			if (table_info.catalog.attach_options.remove_files_on_delete) {
+				auto &fs = FileSystem::GetFileSystem(context);
+				RemoveFilesBestEffort(context, fs, info.created_metadata_files, "metadata file");
+			}
+			throw;
+		}
 		info.created_metadata_files.insert(info.created_metadata_files.end(),
 		                                   table_transaction_info.created_metadata_files.begin(),
 		                                   table_transaction_info.created_metadata_files.end());

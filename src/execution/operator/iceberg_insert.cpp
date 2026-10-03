@@ -98,7 +98,13 @@ IcebergInsertGlobalState::IcebergInsertGlobalState(ClientContext &context)
 }
 
 unique_ptr<GlobalSinkState> IcebergInsert::GetGlobalSinkState(ClientContext &context) const {
-	return make_uniq<IcebergInsertGlobalState>(context);
+	auto result = make_uniq<IcebergInsertGlobalState>(context);
+	Value behavior;
+	if (use_insert_partition_behavior &&
+	    context.TryGetCurrentSetting(INSERT_EXISTING_PARTITIONS_BEHAVIOR_CONFIG_VARIABLE, behavior)) {
+		result->overwrite_partitions = behavior.GetValue<string>() == "overwrite";
+	}
+	return std::move(result);
 }
 
 //===--------------------------------------------------------------------===//
@@ -385,6 +391,45 @@ SinkFinalizeType IcebergInsert::Finalize(Pipeline &pipeline, Event &event, Clien
 				transaction_data.AddUpdateSnapshot(std::move(delete_manifest_entries), std::move(written_files),
 				                                   std::move(delete_global_state.altered_manifests));
 			});
+		}
+	} else if (global_state.overwrite_partitions && !written_files.empty()) {
+		//! Empty writer output must not turn an empty INSERT into a partition replacement.
+		auto &fs = FileSystem::GetFileSystem(context);
+		auto discard_file = [&](const string &path) {
+			if (!table_info.catalog.attach_options.remove_files_on_delete) {
+				return;
+			}
+			try {
+				fs.TryRemoveFile(path);
+			} catch (...) {
+			}
+		};
+		vector<IcebergManifestEntry> non_empty_files;
+		for (auto &entry : written_files) {
+			if (entry.data_file.record_count == 0) {
+				discard_file(entry.data_file.file_path);
+			} else {
+				non_empty_files.push_back(std::move(entry));
+			}
+		}
+		written_files = std::move(non_empty_files);
+		if (written_files.empty()) {
+			return SinkFinalizeType::READY;
+		}
+		vector<string> produced_paths;
+		for (auto &entry : written_files) {
+			produced_paths.push_back(entry.data_file.file_path);
+		}
+		try {
+			ApplyTableUpdate(table_info, iceberg_transaction, [&](IcebergTable &tbl) {
+				tbl.GetOrCreateTransactionData(iceberg_transaction)
+				    .AddPartitionOverwriteSnapshot(std::move(written_files));
+			});
+		} catch (...) {
+			for (auto &path : produced_paths) {
+				discard_file(path);
+			}
+			throw;
 		}
 	} else {
 		// Regular insert: commit an append snapshot.
@@ -1017,6 +1062,7 @@ PhysicalOperator &IcebergCatalog::PlanInsert(ClientContext &context, PhysicalPla
 	// Create Copy Info
 	IcebergCopyInput copy_input(context, table_metadata, schema);
 	auto &insert = planner.Make<IcebergInsert>(op, updated_table_entry, op.column_index_map);
+	insert.Cast<IcebergInsert>().use_insert_partition_behavior = !irc_transaction.planning_merge_into;
 	auto &physical_copy = IcebergInsert::PlanCopyForInsert(context, planner, copy_input, plan);
 	insert.children.push_back(physical_copy);
 

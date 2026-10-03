@@ -1,0 +1,41 @@
+# name: test/sql/local/insert_partition_behavior_setting.test
+# description: Validate the session setting for inserting into existing Iceberg partitions
+# group: [local]
+
+require iceberg
+
+query T
+SELECT current_setting('iceberg_insert_existing_partitions_behavior');
+----
+append
+
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'OVERWRITE';
+
+query T
+SELECT current_setting('iceberg_insert_existing_partitions_behavior');
+----
+overwrite
+
+query T other
+SELECT current_setting('iceberg_insert_existing_partitions_behavior');
+----
+append
+
+statement error
+SET iceberg_insert_existing_partitions_behavior = 'invalid';
+----
+must be 'append' or 'overwrite'
+
+statement error
+SET iceberg_insert_existing_partitions_behavior = NULL;
+----
+must be 'append' or 'overwrite'
+
+statement ok
+RESET iceberg_insert_existing_partitions_behavior;
+
+query T
+SELECT current_setting('iceberg_insert_existing_partitions_behavior');
+----
+append

@@ -11,6 +11,7 @@
 #include "core/metadata/manifest/iceberg_manifest_list.hpp"
 #include "core/metadata/snapshot/iceberg_snapshot.hpp"
 #include "catalog/rest/transaction/iceberg_transaction_metadata.hpp"
+#include "catalog/rest/transaction/iceberg_partition_overwrite.hpp"
 
 namespace duckdb {
 
@@ -32,6 +33,7 @@ public:
 	const vector<IcebergManifestListEntry> &GetManifestFiles() const;
 	void AddManifestFile(IcebergManifestListEntry &&manifest_file);
 	void SetManifestDeletes(VersionedIcebergManifestDeletes manifest_deletes);
+	void SetPartitionOverwrite(IcebergPartitionOverwrite overwrite);
 	IcebergSnapshotOperationType GetOperation() const {
 		return operation;
 	}
@@ -39,6 +41,7 @@ public:
 private:
 	vector<IcebergManifestListEntry> manifest_files;
 	optional<VersionedIcebergManifestDeletes> manifest_deletes;
+	optional<IcebergPartitionOverwrite> partition_overwrite;
 	int32_t schema_id;
 	IcebergSnapshotOperationType operation;
 };

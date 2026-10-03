@@ -7,6 +7,20 @@ This repository contains DuckDB's Apache Iceberg extension. It adds support for 
 
 User-facing documentation is available on the [Iceberg extension page](https://duckdb.org/docs/extensions/iceberg).
 
+## Inserting into existing partitions
+
+`INSERT INTO` appends by default. To replace the Iceberg partitions present in an insert's input, enable the session setting:
+
+```sql
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+INSERT INTO catalog.schema.target SELECT * FROM source;
+RESET iceberg_insert_existing_partitions_behavior;
+```
+
+Each input partition is replaced in full, including transformed partitions. Other partitions are preserved, and new partitions are added. Empty input is a no-op. Nonempty input replaces an unpartitioned table in full. The setting applies only to ordinary `INSERT INTO`.
+
+Replacement commits atomically. On REST catalogs with atomic commit requirements, concurrent writes to different partitions can retry with `commit.retry.*`, reusing written data files. Changes to data or delete files in a target partition cause a conflict. Changes to unpartitioned delete files also conflict. Live data written under another partition spec is currently unsupported.
+
 ## Development setup
 
 Clone the repository with its DuckDB and extension tooling submodules:

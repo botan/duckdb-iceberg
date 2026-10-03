@@ -1,6 +1,7 @@
 #include "planning/scan_plan/iceberg_scan_planner.hpp"
 
 #include "catalog/rest/catalog_entry/table/iceberg_table_schema_version.hpp"
+#include "catalog/rest/transaction/iceberg_transaction_data.hpp"
 #include "common/iceberg_utils.hpp"
 #include "core/metadata/iceberg_table_metadata.hpp"
 #include "core/metadata/partition/iceberg_partition_constants.hpp"
@@ -205,6 +206,11 @@ IcebergScanPlanner::GetDataFile(idx_t file_id, annotated_lock_guard<annotated_mu
 			shared_state->data_file_partitions[data_file.file_path] = std::move(partition);
 			auto bound_entry = bound_manifest.BindEntry(manifest_entry);
 			if (manifest_entry.status == IcebergManifestEntryStatusType::DELETED) {
+				continue;
+			}
+			auto transaction_data = shared_state->Configuration().scan_info->transaction_data;
+			if (transaction_data &&
+			    transaction_data->IsFileInvalidated({data_file.file_path, data_file.content_offset})) {
 				continue;
 			}
 			if (table_filters.HasFilters() && !IcebergFilePruner(context, GetMetadata(), GetSchema(), table_filters)

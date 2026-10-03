@@ -1,0 +1,150 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/transactions/test_partition_overwrite_commit_retry.test
+# description: Partition overwrites retry unrelated commits and reject changes to their replacement scope
+# group: [transactions]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env METADATA_FILE_READ_SUPPORT
+
+require-env METADATA_LOG_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.partition_overwrite_retry;
+
+statement ok
+CREATE TABLE my_datalake.default.partition_overwrite_retry (p INTEGER, id INTEGER) PARTITIONED BY (p)
+WITH ('commit.manifest.min-count-to-merge' = '2');
+
+statement ok
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok a
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok b
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+# Both transactions write before either commits. The second commit must rebase.
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (1, 11);
+
+statement ok b
+BEGIN;
+
+statement ok b
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (2, 21);
+
+statement ok b
+COMMIT;
+
+statement ok a
+COMMIT;
+
+query II
+SELECT * FROM my_datalake.default.partition_overwrite_retry ORDER BY p;
+----
+1	11
+2	21
+3	30
+
+# Concurrent replacement of the same existing partition must conflict.
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (1, 12);
+
+statement ok b
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (1, 13);
+
+statement error a
+COMMIT;
+----
+conflicts with a concurrent change to the target partitions
+
+# The same validation protects partitions that were absent at the starting snapshot.
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (4, 40);
+
+statement ok b
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (4, 41);
+
+statement error a
+COMMIT;
+----
+conflicts with a concurrent change to the target partitions
+
+# A new delete file in the target partition conflicts even if its data files remain live.
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (3, 31);
+
+statement ok b
+DELETE FROM my_datalake.default.partition_overwrite_retry WHERE p = 3;
+
+statement error a
+COMMIT;
+----
+conflicts with a concurrent change to the target partitions
+
+# An ordinary append into the target partition must also conflict.
+statement ok b
+SET iceberg_insert_existing_partitions_behavior = 'append';
+
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (2, 22);
+
+statement ok b
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (2, 23);
+
+statement error a
+COMMIT;
+----
+conflicts with a concurrent change to the target partitions
+
+query II
+SELECT * FROM my_datalake.default.partition_overwrite_retry ORDER BY p, id;
+----
+1	13
+2	21
+2	23
+4	41
+
+# A partition-spec change must conflict even when it does not change the table snapshot.
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_retry VALUES (1, 14);
+
+statement ok b
+ALTER TABLE my_datalake.default.partition_overwrite_retry SET PARTITIONED BY (id);
+
+statement error a
+COMMIT;
+----
+changed incompatibly while retrying commit
+
+query II
+SELECT * FROM my_datalake.default.partition_overwrite_retry ORDER BY p, id;
+----
+1	13
+2	21
+2	23
+4	41
+
+statement ok
+DROP TABLE my_datalake.default.partition_overwrite_retry;

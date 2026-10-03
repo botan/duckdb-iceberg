@@ -1,0 +1,120 @@
+# name: test/sql/local/catalog_test_config_setup/catalog_agnostic/insert/test_insert_partition_overwrite_v3.test
+# description: Partition replacement preserves retained row lineage and allocates new row IDs across retries
+# group: [insert]
+
+require-env CATALOG_TEST_CONFIG_SETUP
+
+require-env FORMAT_V3_SUPPORT
+
+include test/sql/init_requires
+
+statement ok
+DROP TABLE IF EXISTS my_datalake.default.partition_overwrite_v3;
+
+statement ok
+CREATE TABLE my_datalake.default.partition_overwrite_v3 (p INTEGER, id INTEGER)
+PARTITIONED BY (p) WITH ('format-version' = 3, 'commit.manifest.min-count-to-merge' = '2');
+
+statement ok
+INSERT INTO my_datalake.default.partition_overwrite_v3 VALUES (1, 10), (1, 11), (2, 20), (2, 21), (3, 30);
+
+statement ok
+CREATE TEMP TABLE original_lineage AS
+SELECT p, id, _row_id, _last_updated_sequence_number FROM my_datalake.default.partition_overwrite_v3;
+
+# Rewriting a manifest containing multiple partitions must keep retained row IDs.
+statement ok
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok
+INSERT INTO my_datalake.default.partition_overwrite_v3 VALUES (1, 12), (1, 13);
+
+query I
+SELECT count(*) FROM my_datalake.default.partition_overwrite_v3 t
+JOIN original_lineage o ON t.id = o.id
+WHERE t.p <> 1 AND t._row_id = o._row_id
+AND t._last_updated_sequence_number = o._last_updated_sequence_number;
+----
+3
+
+query III
+SELECT count(*), min(_row_id), max(_row_id)
+FROM my_datalake.default.partition_overwrite_v3 WHERE p = 1;
+----
+2	5	6
+
+query I
+SELECT DISTINCT _last_updated_sequence_number FROM my_datalake.default.partition_overwrite_v3 WHERE p = 1;
+----
+2
+
+# Carried-over and deleted entries materialize their inherited first-row-id on disk.
+statement ok
+BEGIN;
+
+statement ok
+SET VARIABLE carried_manifest = (
+SELECT manifest_path FROM iceberg_metadata(my_datalake.default.partition_overwrite_v3)
+WHERE status = 'EXISTING' AND manifest_sequence_number = 2 LIMIT 1);
+
+query I
+SELECT bool_and(data_file.first_row_id IS NOT NULL) FROM read_avro(getvariable('carried_manifest'));
+----
+true
+
+statement ok
+COMMIT;
+
+statement ok a
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+statement ok b
+SET iceberg_insert_existing_partitions_behavior = 'overwrite';
+
+# Both statements start at the same next-row-id; the retry must allocate disjoint IDs.
+statement ok a
+BEGIN;
+
+statement ok a
+INSERT INTO my_datalake.default.partition_overwrite_v3 VALUES (2, 22);
+
+statement ok b
+INSERT INTO my_datalake.default.partition_overwrite_v3 VALUES (1, 14);
+
+statement ok a
+COMMIT;
+
+query IIII
+SELECT p, id, _row_id, _last_updated_sequence_number
+FROM my_datalake.default.partition_overwrite_v3 WHERE p <> 3 ORDER BY p;
+----
+1	14	7	3
+2	22	8	4
+
+query I
+SELECT count(*) FROM my_datalake.default.partition_overwrite_v3 t
+JOIN original_lineage o ON t.id = o.id
+WHERE t.p = 3 AND t._row_id = o._row_id
+AND t._last_updated_sequence_number = o._last_updated_sequence_number;
+----
+1
+
+# Existing deletion vectors in a replaced partition must not remove the new rows.
+statement ok
+DELETE FROM my_datalake.default.partition_overwrite_v3 WHERE p = 2;
+
+statement ok
+INSERT INTO my_datalake.default.partition_overwrite_v3 VALUES (2, 23);
+
+query II
+SELECT p, id FROM my_datalake.default.partition_overwrite_v3 ORDER BY p;
+----
+1	14
+2	23
+3	30
+
+statement ok
+DROP TABLE my_datalake.default.partition_overwrite_v3;
+
+statement ok
+RESET iceberg_insert_existing_partitions_behavior;

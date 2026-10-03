@@ -242,6 +242,35 @@ void IcebergTransactionData::AddDeleteManifestFiles(IcebergAddSnapshot &add_snap
 	}
 }
 
+void IcebergTransactionData::AddPartitionOverwriteSnapshot(vector<IcebergManifestEntry> &&data_files) {
+	lock_guard<mutex> guard(lock);
+	auto &metadata = table_info.table_metadata;
+	CacheExistingManifestList(guard, metadata);
+
+	//! Include earlier statements in this transaction and ignore files they already invalidated.
+	auto manifests = existing_manifest_list;
+	for (auto &alter : alters) {
+		auto &files = alter.get().GetManifestFiles();
+		manifests.insert(manifests.end(), files.begin(), files.end());
+	}
+	IcebergCommitState commit_state(table_info, context);
+	commit_state.latest_snapshot = metadata.GetLatestSnapshot();
+	IcebergPartitionOverwrite overwrite(metadata, data_files);
+	auto deletes = overwrite.Initialize(manifests, manifest_deletes, commit_state);
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto manifest_metadata = IcebergManifestMetadata::FromTableMetadata(metadata, IcebergManifestContentType::DATA);
+	auto manifest =
+	    IcebergManifestListEntry::CreateFromEntries(fs, metadata.last_sequence_number + alters.size() + 1, metadata,
+	                                                manifest_metadata, std::move(data_files), next_row_id);
+	auto add_snapshot = make_uniq<IcebergAddSnapshot>(table_info, IcebergSnapshotOperationType::OVERWRITE);
+	add_snapshot->SetPartitionOverwrite(std::move(overwrite));
+	add_snapshot->AddManifestFile(std::move(manifest));
+	TableAddAssertCurrentSchemaId();
+	assert_default_spec_id = true;
+	AddSnapshotUpdate(std::move(add_snapshot), std::move(deletes));
+}
+
 void IcebergTransactionData::AddSnapshotUpdate(unique_ptr<IcebergAddSnapshot> add_snapshot,
                                                IcebergManifestDeletes &&altered_manifests) {
 	auto versioned_deletes = manifest_deletes.AtVersion(alters.size());

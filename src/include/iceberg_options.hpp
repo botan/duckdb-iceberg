@@ -15,6 +15,8 @@ static constexpr const char *VERSION_GUESSING_CONFIG_VARIABLE = "unsafe_enable_v
 // (InvalidConfigurationException).
 static constexpr const char *DEFAULT_FORMAT_VERSION_CONFIG_VARIABLE = "iceberg_default_format_version";
 static constexpr uint64_t DEFAULT_ICEBERG_FORMAT_VERSION = 2;
+static constexpr const char *INSERT_EXISTING_PARTITIONS_BEHAVIOR_CONFIG_VARIABLE =
+    "iceberg_insert_existing_partitions_behavior";
 // The highest Iceberg format version this extension can read and write
 static constexpr int32_t MAX_ICEBERG_FORMAT_VERSION = 3;
 

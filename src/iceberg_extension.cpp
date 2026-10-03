@@ -51,6 +51,19 @@ static void SetMetadataLogClockSkew(ClientContext &context, SetScope scope, Valu
 	}
 }
 
+static void SetInsertExistingPartitionsBehavior(ClientContext &context, SetScope scope, Value &parameter) {
+	if (parameter.IsNull()) {
+		throw InvalidConfigurationException("'%s' must be 'append' or 'overwrite'",
+		                                    INSERT_EXISTING_PARTITIONS_BEHAVIOR_CONFIG_VARIABLE);
+	}
+	auto behavior = StringUtil::Lower(parameter.GetValue<string>());
+	if (behavior != "append" && behavior != "overwrite") {
+		throw InvalidConfigurationException("'%s' must be 'append' or 'overwrite', got '%s'",
+		                                    INSERT_EXISTING_PARTITIONS_BEHAVIOR_CONFIG_VARIABLE, behavior);
+	}
+	parameter = Value(behavior);
+}
+
 static void SetUnsafeStructNullDefaultInterpretation(ClientContext &context, SetScope scope, Value &parameter) {
 	auto &value = IcebergDefault::InterpretStructNullAsEmpty();
 	if (parameter.IsNull()) {
@@ -118,6 +131,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "The Iceberg format version used when creating a new table without an explicit 'format-version' property. "
 	    "Valid values are 2 and 3.",
 	    LogicalType::UBIGINT, Value::UBIGINT(DEFAULT_ICEBERG_FORMAT_VERSION), SetDefaultFormatVersion);
+	config.AddExtensionOption(
+	    INSERT_EXISTING_PARTITIONS_BEHAVIOR_CONFIG_VARIABLE,
+	    "Whether INSERT INTO appends to existing Iceberg partitions or replaces the partitions present in its input. "
+	    "Valid values are append and overwrite.",
+	    LogicalType::VARCHAR, Value("append"), SetInsertExistingPartitionsBehavior);
 	config.AddExtensionOption(
 	    "iceberg_use_metadata_log",
 	    "Use metadata-log to select table metadata as of the transaction start for snapshot isolation. "
